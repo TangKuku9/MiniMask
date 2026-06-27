@@ -1,0 +1,7 @@
+/target
+/web-ui/node_modules
+/web-ui/dist
+/data
+*.pem
+*.log
+

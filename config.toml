@@ -1,0 +1,36 @@
+# MiniMask server configuration.
+# This file is auto-created with these defaults on first run if missing.
+
+[server]
+# Address the tunnel clients connect to (TLS + yamux).
+tunnel_bind = "0.0.0.0:7443"
+# Address the management Web UI / REST API listens on.
+web_bind = "0.0.0.0:8080"
+# Directory for persistent state (clients.json, auth.json) and certs.
+data_dir = "./data"
+# Enable TLS for the tunnel listener (recommended).
+tunnel_tls = true
+# Enable HTTPS for the Web UI. Off by default for local dev; turn on for remote access.
+web_tls = false
+# TLS certificate / key paths. Auto-generated (self-signed) on first run if absent.
+cert_path = "./data/cert.pem"
+key_path = "./data/key.pem"
+# Subject Alternative Names embedded in the auto-generated certificate.
+cert_san = ["localhost", "127.0.0.1"]
+
+[auth]
+# Initial administrator credentials. Seeded into data/auth.json on first run.
+admin_username = "admin"
+admin_password = "admin"
+# Secret used to sign JWTs. Auto-generated on first run if left empty.
+jwt_secret = ""
+# JWT lifetime in hours.
+token_ttl_hours = 24
+
+[security]
+# Max concurrent tunnel clients.
+max_clients = 100
+# Max concurrent proxied connections per tunnel client.
+max_conns_per_client = 512
+# Bandwidth limit in bytes/sec per tunnel client (0 = unlimited).
+bw_limit_per_client = 0
