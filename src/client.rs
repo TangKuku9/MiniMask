@@ -31,24 +31,31 @@ pub struct ClientArgs {
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
-    tracing::info!(
-        "MiniMask client connecting to {} (tls={}) as {}",
-        args.server,
-        args.tls,
-        args.id
-    );
+    eprintln!("[minimask] client connecting to {} (tls={}) as {}", args.server, args.tls, args.id);
     loop {
         match run_once(&args).await {
-            Ok(()) => tracing::info!("tunnel closed; reconnecting in 3s"),
-            Err(e) => tracing::warn!("tunnel error: {e}; reconnecting in 3s"),
+            Ok(()) => eprintln!("[minimask] tunnel closed; reconnecting in 3s"),
+            Err(e) => eprintln!("[minimask] tunnel error: {e}; reconnecting in 3s"),
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 
 async fn run_once(args: &ClientArgs) -> Result<()> {
+    eprintln!("[minimask] connecting to {} ...", args.server);
     let stream = TcpStream::connect(&args.server).await?;
+    eprintln!("[minimask] tcp connected to {}", args.server);
+
+    // Enable TCP keepalive to prevent NAT/firewall idle timeouts from killing
+    // the otherwise-idle tunnel connection.
+    {
+        let sock_ref = socket2::SockRef::from(&stream);
+        let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+        let _ = sock_ref.set_tcp_keepalive(&ka);
+    }
+
     let mut boxed: Box<dyn crate::util::AsyncStream + Send + Unpin> = if args.tls {
+        eprintln!("[minimask] starting tls handshake (server_name={})", args.server_name);
         let connector = util::build_dangerous_tls_connector()?;
         let server_name = rustls::pki_types::ServerName::try_from(args.server_name.clone())
             .map_err(|e| anyhow!("invalid server name '{}': {e}", args.server_name))?;
@@ -56,13 +63,28 @@ async fn run_once(args: &ClientArgs) -> Result<()> {
     } else {
         Box::new(stream)
     };
+    eprintln!("[minimask] tls/plain stream ready");
 
+    eprintln!("[minimask] sending handshake (id={})", args.id);
     protocol::write_handshake(&mut boxed, &args.id, &args.token).await?;
-    let (ok, msg) = protocol::read_status(&mut boxed).await?;
+    eprintln!("[minimask] waiting for auth result...");
+    let (ok, msg) = match protocol::read_status(&mut boxed).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Provide a helpful hint when the server closes the connection
+            // immediately after the handshake. This usually means the server
+            // expects TLS but the client connected without --tls.
+            if !args.tls {
+                eprintln!("[minimask] hint: server closed the connection right after the handshake.");
+                eprintln!("[minimask] hint: the server may require TLS. Try adding --tls to your command.");
+            }
+            return Err(e);
+        }
+    };
     if !ok {
         return Err(anyhow!("server rejected: {msg}"));
     }
-    tracing::info!("authenticated; tunnel established");
+    eprintln!("[minimask] authenticated; tunnel established");
 
     let conn = yamux::Connection::new(boxed.compat(), yamux::Config::default(), yamux::Mode::Client);
     run_client_session(conn).await;

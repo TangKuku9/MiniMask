@@ -52,6 +52,14 @@ async fn handle_tunnel(
     state: AppState,
     tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
+    // Enable TCP keepalive to prevent NAT/firewall idle timeouts from killing
+    // the otherwise-idle tunnel connection.
+    {
+        let sock_ref = socket2::SockRef::from(&stream);
+        let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
+        let _ = sock_ref.set_tcp_keepalive(&ka);
+    }
+
     // Unify TLS/plain into a single boxed tokio I/O object.
     let mut boxed: Box<dyn crate::util::AsyncStream + Send + Unpin> =
         match tls {

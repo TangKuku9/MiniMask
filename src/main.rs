@@ -52,6 +52,13 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // On Windows, set the console output codepage to UTF-8 so that error
+    // messages (which may contain non-ASCII characters) are displayed correctly.
+    #[cfg(windows)]
+    {
+        let _ = enable_vt_processing();
+    }
+
     util::install_crypto_provider();
     init_tracing();
 
@@ -89,12 +96,45 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Enable UTF-8 and virtual terminal processing on the Windows console so that
+/// non-ASCII error messages and tracing logs are displayed correctly.
+#[cfg(windows)]
+fn enable_vt_processing() -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, SetConsoleOutputCP,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE,
+    };
+
+    unsafe {
+        // Set both stdout and stderr codepage to UTF-8 (65001).
+        SetConsoleOutputCP(65001);
+
+        // Enable virtual terminal processing (ANSI escape sequences) on stdout
+        // and stderr so that tracing's colored output works.
+        for handle in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(handle);
+            if h == 0 || h == -1 {
+                continue;
+            }
+            let mut mode = 0u32;
+            if GetConsoleMode(h, &mut mode) != 0 {
+                SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "minimask=info,tower_http=info".into()),
         )
+        // Output to stderr to avoid Windows stdout block-buffering issues when
+        // the process is not attached to an interactive TTY (e.g. release builds
+        // launched from PowerShell). stderr is unbuffered by default.
+        .with_writer(std::io::stderr)
         .init();
 }
 
