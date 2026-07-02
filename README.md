@@ -14,6 +14,7 @@ TLS 隧道服务端与图形化管理后台（Vue3 SPA 编译进二进制），�
 - **端口映射热更新**：客户端在线时新增/删除/启停映射立即生效，无需重连。
 - **审计日志**：登录、增删改、隧道连接等关键操作全部记录。
 - **配套客户端**：同二进制 `client` 子命令，方便端到端测试与自部署。
+- **双模式客户端**：命令行可用，双击 exe 也会自动弹出图形化客户端界面（egui，纯 Rust 内嵌）。
 
 ## 快速开始
 
@@ -43,6 +44,24 @@ cargo run --release -- client --server 127.0.0.1:7443 --tls \
 | `minimask client --server <host:port> --tls --id <id> --token <token>` | 运行隧道客户端 |
 | `minimask gen-cert --out-cert cert.pem --out-key key.pem` | 生成自签证书 |
 | `minimask hash-password <password>` | 生成 argon2 密码哈希 |
+| `minimask gui`（或 `--gui`，或直接双击 exe） | 打开图形化客户端界面 |
+
+## 图形化客户端
+
+MiniMask 是**双模式程序**：
+
+- **命令行执行**：从终端带参数运行时（如 `minimask client ...` 或 `minimask server`），行为与以往完全一致，日志输出到终端。
+- **双击打开界面**：在资源管理器中直接双击 `MiniMask.exe`（无参数、非终端启动）时，程序会自动隐藏控制台窗口并打开图形化客户端界面。也可显式执行 `minimask gui` 或加 `--gui`。
+
+图形界面（中文本地化、深/浅色主题）提供：
+
+- **连接配置**：服务器地址、客户端 ID、Token（可切换显示/隐藏）、是否启用 TLS、Server Name（SNI）。
+- **一键连接/断开**：后台自动重连，掉线不需手动干预。
+- **实时状态**：未连接/连接中/已连接/重连中彩色徽章，显示运行时长与重连次数。
+- **实时日志**：分级彩色日志、自动滚动、一键清空。
+- **配置持久化**：上次填写的连接参数自动保存到 `data/client_gui.json`，下次一键连接。
+
+> 双击检测原理：Windows 下用 `GetConsoleProcessList` 判断控制台是否仅挂载本进程，据此区分「双击启动」与「从终端启动」，双击时调用 `FreeConsole` 隐藏黑窗口。
 
 ## 架构
 
@@ -131,4 +150,4 @@ docker run -p 8080:8080 -p 7443:7443 -v $(pwd)/data:/app/data minimask
 
 ## 技术栈
 
-Rust · tokio · axum · yamux · rustls(ring) · rcgen · rust-embed · serde/toml · tracing · clap · argon2 · jsonwebtoken ｜ Vue3 · Vite · TailwindCSS
+Rust · tokio · axum · yamux · rustls(ring) · rcgen · rust-embed · serde/toml · tracing · clap · argon2 · jsonwebtoken · eframe/egui（GUI）｜ Vue3 · Vite · TailwindCSS

@@ -41,6 +41,10 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 
+# GUI client (pure-Rust immediate-mode UI, embedded into the single binary).
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.29"
+
 # tikv-jemallocator reduces fragmentation on long-running servers.
 # Only enabled on non-MSVC unix targets to avoid Windows build issues.
 [target.'cfg(all(unix, not(target_env = "msvc")))'.dependencies]
