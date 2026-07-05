@@ -83,20 +83,32 @@ impl ClientStore {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            let store = Self { list: Vec::new(), path };
-            store.persist()?;
-            Ok(store)
+            // P1-7: initial creation uses sync I/O (startup only, not hot path).
+            let list = Vec::new();
+            let json = serde_json::to_string_pretty(&list).context("serialize clients")?;
+            std::fs::write(&path, json).context("write clients")?;
+            Ok(Self { list, path })
         }
     }
 
-    pub fn persist(&self) -> Result<()> {
+    /// Persist the store to disk using async I/O (tokio::fs).
+    ///
+    /// P1-7: previously this used `std::fs` (blocking) and was called from
+    /// within `RwLock<ClientStore>` write guards, blocking the executor thread
+    /// on slow disks. Now uses `tokio::fs` which offloads I/O to a blocking
+    /// thread pool, so the executor stays responsive.
+    pub async fn persist(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            tokio::fs::create_dir_all(parent).await.ok();
         }
         let json = serde_json::to_string_pretty(&self.list).context("serialize clients")?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).context("write clients tmp")?;
-        std::fs::rename(&tmp, &self.path).context("rename clients")?;
+        tokio::fs::write(&tmp, json)
+            .await
+            .with_context(|| format!("write clients tmp {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, &self.path)
+            .await
+            .with_context(|| format!("rename clients to {}", self.path.display()))?;
         Ok(())
     }
 
@@ -114,8 +126,8 @@ impl ClientStore {
         None
     }
 
-    pub fn verify_token(&self, token: &str) -> Option<(String, bool)> {
-        let h = util::sha256_hex(token);
+    pub fn verify_token(&self, token: &str, pepper: &str) -> Option<(String, bool)> {
+        let h = util::sha256_hex_with_pepper(token, pepper);
         self.list
             .iter()
             .find(|c| c.token_hash == h && c.enabled)
@@ -130,55 +142,55 @@ impl ClientStore {
         })
     }
 
-    pub fn add_client(&mut self, name: &str) -> Result<(Client, String)> {
+    pub async fn add_client(&mut self, name: &str, pepper: &str) -> Result<(Client, String)> {
         let token = util::gen_token();
         let client = Client {
             id: util::gen_client_id(),
             name: name.to_string(),
-            token_hash: util::sha256_hex(&token),
+            token_hash: util::sha256_hex_with_pepper(&token, pepper),
             token_prefix: token.chars().take(12).collect(),
             enabled: true,
             created_at: Utc::now(),
             mappings: Vec::new(),
         };
         self.list.push(client.clone());
-        self.persist()?;
+        self.persist().await?;
         Ok((client, token))
     }
 
-    pub fn delete_client(&mut self, id: &str) -> Result<bool> {
+    pub async fn delete_client(&mut self, id: &str) -> Result<bool> {
         let before = self.list.len();
         self.list.retain(|c| c.id != id);
         let changed = self.list.len() != before;
         if changed {
-            self.persist()?;
+            self.persist().await?;
         }
         Ok(changed)
     }
 
-    pub fn set_client_enabled(&mut self, id: &str, enabled: bool) -> Result<bool> {
+    pub async fn set_client_enabled(&mut self, id: &str, enabled: bool) -> Result<bool> {
         if let Some(c) = self.list.iter_mut().find(|c| c.id == id) {
             c.enabled = enabled;
-            self.persist()?;
+            self.persist().await?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    pub fn regenerate_token(&mut self, id: &str) -> Result<Option<String>> {
+    pub async fn regenerate_token(&mut self, id: &str, pepper: &str) -> Result<Option<String>> {
         let token = util::gen_token();
         if let Some(c) = self.list.iter_mut().find(|c| c.id == id) {
-            c.token_hash = util::sha256_hex(&token);
+            c.token_hash = util::sha256_hex_with_pepper(&token, pepper);
             c.token_prefix = token.chars().take(12).collect();
-            self.persist()?;
+            self.persist().await?;
             Ok(Some(token))
         } else {
             Ok(None)
         }
     }
 
-    pub fn add_mapping(
+    pub async fn add_mapping(
         &mut self,
         client_id: &str,
         name: &str,
@@ -198,14 +210,14 @@ impl ClientStore {
                 created_at: Utc::now(),
             };
             c.mappings.push(m.clone());
-            self.persist()?;
+            self.persist().await?;
             Ok(Some(m))
         } else {
             Ok(None)
         }
     }
 
-    pub fn delete_mapping(&mut self, id: &str) -> Result<bool> {
+    pub async fn delete_mapping(&mut self, id: &str) -> Result<bool> {
         let mut changed = false;
         for c in self.list.iter_mut() {
             let before = c.mappings.len();
@@ -215,12 +227,12 @@ impl ClientStore {
             }
         }
         if changed {
-            self.persist()?;
+            self.persist().await?;
         }
         Ok(changed)
     }
 
-    pub fn set_mapping_enabled(&mut self, id: &str, enabled: bool) -> Result<bool> {
+    pub async fn set_mapping_enabled(&mut self, id: &str, enabled: bool) -> Result<bool> {
         let mut found = false;
         for c in self.list.iter_mut() {
             if let Some(m) = c.mappings.iter_mut().find(|m| m.id == id) {
@@ -229,7 +241,7 @@ impl ClientStore {
             }
         }
         if found {
-            self.persist()?;
+            self.persist().await?;
         }
         Ok(found)
     }
@@ -338,7 +350,7 @@ pub struct StatsSnapshot {
 }
 
 // ===========================================================================
-// Audit log (in-memory ring buffer)
+// Audit log (in-memory ring buffer + optional file persistence)
 // ===========================================================================
 
 #[derive(Debug, Clone, Serialize)]
@@ -352,14 +364,37 @@ pub struct AuditLog {
 pub struct AuditLogStore {
     logs: Mutex<VecDeque<AuditLog>>,
     cap: usize,
+    /// Optional file persistence target (JSON-lines, with size-based rotation).
+    file: Option<AuditLogFile>,
+}
+
+struct AuditLogFile {
+    path: PathBuf,
+    max_bytes: u64,
 }
 
 impl AuditLogStore {
+    /// Create an in-memory ring buffer with the given capacity.
     pub fn new(cap: usize) -> Self {
         Self {
             logs: Mutex::new(VecDeque::with_capacity(cap)),
             cap,
+            file: None,
         }
+    }
+
+    /// Enable file persistence. Each `add()` call will append a JSON line to
+    /// `path`. When the file exceeds `max_size_mb`, it is rotated to
+    /// `<path>.1` and a new file is started.
+    pub fn with_file(mut self, path: PathBuf, max_size_mb: u64) -> Self {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        self.file = Some(AuditLogFile {
+            path,
+            max_bytes: max_size_mb.saturating_mul(1024 * 1024),
+        });
+        self
     }
 
     pub async fn add(&self, level: &str, category: &str, message: impl Into<String>) {
@@ -374,15 +409,53 @@ impl AuditLogStore {
             "error" => tracing::error!("[{category}] {}", entry.message),
             _ => tracing::info!("[{category}] {}", entry.message),
         }
-        let mut g = self.logs.lock().await;
-        if g.len() >= self.cap {
-            g.pop_front();
+        // Push to in-memory ring buffer (brief lock).
+        {
+            let mut g = self.logs.lock().await;
+            if g.len() >= self.cap {
+                g.pop_front();
+            }
+            g.push_back(entry.clone());
         }
-        g.push_back(entry);
+        // P1-6: append to file outside the in-memory lock so the ring buffer
+        // stays responsive even when disk I/O is slow.
+        if let Some(file) = &self.file {
+            if let Err(e) = file.append(&entry).await {
+                tracing::warn!("audit log file write failed: {e}");
+            }
+        }
     }
 
     pub async fn list(&self) -> Vec<AuditLog> {
         self.logs.lock().await.iter().cloned().collect()
+    }
+}
+
+impl AuditLogFile {
+    async fn append(&self, entry: &AuditLog) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        // Rotate if the file is too large. Check size before writing to avoid
+        // rotating on every single entry.
+        if let Ok(meta) = tokio::fs::metadata(&self.path).await {
+            if meta.len() >= self.max_bytes {
+                let backup = self.path.with_extension("log.1");
+                // Best-effort rotation; if rename fails we just keep appending.
+                let _ = tokio::fs::rename(&self.path, &backup).await;
+            }
+        }
+
+        let line = serde_json::to_string(entry).context("serialize audit log")? + "\n";
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+            .with_context(|| format!("open audit log {}", self.path.display()))?;
+        f.write_all(line.as_bytes())
+            .await
+            .with_context(|| format!("write audit log {}", self.path.display()))?;
+        Ok(())
     }
 }
 
@@ -417,20 +490,28 @@ impl AuthStore {
                 username: username.to_string(),
                 password_hash: util::hash_password(password)?,
             };
-            let store = Self {
-                inner: RwLock::new(f.clone()),
+            // P1-7: initial creation uses sync I/O (startup only, not hot path).
+            let json = serde_json::to_string_pretty(&f).context("serialize auth")?;
+            std::fs::write(&path, json).with_context(|| format!("write auth {}", path.display()))?;
+            Ok(Self {
+                inner: RwLock::new(f),
                 path,
-            };
-            store.persist_inner(&f)?;
-            Ok(store)
+            })
         }
     }
 
-    fn persist_inner(&self, f: &AuthFile) -> Result<()> {
+    /// Persist auth state using async I/O (tokio::fs).
+    ///
+    /// P1-7: previously used `std::fs` (blocking) under the write lock.
+    async fn persist_inner(&self, f: &AuthFile) -> Result<()> {
         let json = serde_json::to_string_pretty(f).context("serialize auth")?;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).context("write auth tmp")?;
-        std::fs::rename(&tmp, &self.path).context("rename auth")?;
+        tokio::fs::write(&tmp, json)
+            .await
+            .with_context(|| format!("write auth tmp {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, &self.path)
+            .await
+            .with_context(|| format!("rename auth to {}", self.path.display()))?;
         Ok(())
     }
 
@@ -448,7 +529,7 @@ impl AuthStore {
             g.password_hash = util::hash_password(new_password)?;
             g.clone()
         };
-        self.persist_inner(&f)
+        self.persist_inner(&f).await
     }
 }
 
@@ -473,6 +554,15 @@ impl WsBroadcaster {
         rx
     }
 
+    /// Current number of live subscribers. Used by the stats sampler to skip
+    /// broadcasting when no dashboard is watching (P2-12).
+    pub async fn subscriber_count(&self) -> usize {
+        let mut g = self.clients.lock().await;
+        // Prune disconnected senders so the count is accurate.
+        g.retain(|s| !s.is_closed());
+        g.len()
+    }
+
     pub async fn broadcast(&self, msg: String) {
         let mut g = self.clients.lock().await;
         g.retain(|s| s.send(msg.clone()).is_ok());
@@ -492,6 +582,11 @@ pub struct AppState {
     pub logs: Arc<AuditLogStore>,
     pub auth: Arc<AuthStore>,
     pub ws: Arc<WsBroadcaster>,
+    /// Server-side pepper mixed into client token hashes (P2-14). Prevents
+    /// rainbow-table attacks in case `clients.json` is leaked: an attacker
+    /// would need the pepper (stored separately in `data/token_pepper`) to
+    /// mount even a brute-force attack against individual tokens.
+    pub token_pepper: Arc<String>,
 }
 
 impl AppState {

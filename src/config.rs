@@ -9,6 +9,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,12 +28,20 @@ pub struct ServerConfig {
     /// Enable HTTPS for the Web UI.
     #[serde(default)]
     pub web_tls: bool,
-    /// TLS certificate PEM path.
+    /// TLS certificate PEM path (server cert signed by the CA).
     #[serde(default = "default_cert_path")]
     pub cert_path: PathBuf,
-    /// TLS private key PEM path.
+    /// TLS private key PEM path (server key).
     #[serde(default = "default_key_path")]
     pub key_path: PathBuf,
+    /// CA certificate PEM path. This file is distributed to clients for
+    /// CA pinning and must be kept in sync with the server cert above.
+    #[serde(default = "default_ca_path")]
+    pub ca_path: PathBuf,
+    /// CA private key PEM path. Used only to sign the initial server cert;
+    /// kept on disk so future rotations can sign new server certs.
+    #[serde(default = "default_ca_key_path")]
+    pub ca_key_path: PathBuf,
     /// Subject Alternative Names embedded in the auto-generated certificate.
     #[serde(default = "default_san")]
     pub cert_san: Vec<String>,
@@ -55,8 +65,37 @@ pub struct SecurityConfig {
     pub max_clients: usize,
     #[serde(default = "default_max_conns")]
     pub max_conns_per_client: usize,
-    #[serde(default)]
-    pub bw_limit_per_client: u64,
+}
+
+/// Audit log configuration. The in-memory ring buffer is always maintained for
+/// the Web UI, but entries can additionally be appended to a file for
+/// long-term retention and compliance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    /// File path for persistent audit log (JSON-lines format). Set to empty
+    /// to disable file persistence.
+    #[serde(default = "default_audit_log_file")]
+    pub log_file: PathBuf,
+    /// Maximum file size in MiB before rotation. When the file exceeds this,
+    /// it is renamed to `<file>.1` and a new file is started.
+    #[serde(default = "default_audit_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            log_file: default_audit_log_file(),
+            max_size_mb: default_audit_max_size_mb(),
+        }
+    }
+}
+
+fn default_audit_log_file() -> PathBuf {
+    PathBuf::from("./data/audit.log")
+}
+fn default_audit_max_size_mb() -> u64 {
+    10
 }
 
 fn default_data_dir() -> PathBuf {
@@ -67,6 +106,12 @@ fn default_cert_path() -> PathBuf {
 }
 fn default_key_path() -> PathBuf {
     PathBuf::from("./data/key.pem")
+}
+fn default_ca_path() -> PathBuf {
+    PathBuf::from("./data/ca.pem")
+}
+fn default_ca_key_path() -> PathBuf {
+    PathBuf::from("./data/ca_key.pem")
 }
 fn default_san() -> Vec<String> {
     vec!["localhost".to_string(), "127.0.0.1".to_string()]
@@ -101,6 +146,8 @@ impl Default for Config {
                 web_tls: false,
                 cert_path: default_cert_path(),
                 key_path: default_key_path(),
+                ca_path: default_ca_path(),
+                ca_key_path: default_ca_key_path(),
                 cert_san: default_san(),
             },
             auth: AuthConfig {
@@ -112,8 +159,8 @@ impl Default for Config {
             security: SecurityConfig {
                 max_clients: default_max_clients(),
                 max_conns_per_client: default_max_conns(),
-                bw_limit_per_client: 0,
             },
+            audit: AuditConfig::default(),
         }
     }
 }

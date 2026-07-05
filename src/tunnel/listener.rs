@@ -9,6 +9,7 @@ use chrono::Utc;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -54,22 +55,44 @@ async fn handle_tunnel(
 ) -> Result<()> {
     // Enable TCP keepalive to prevent NAT/firewall idle timeouts from killing
     // the otherwise-idle tunnel connection.
+    // P2-15: explicitly set interval and retries (where supported) instead of
+    // relying on OS defaults, which on Linux can be ~2 hours before the first
+    // probe. With these settings the first probe fires after 30s of idle, then
+    // every 15s up to 3 missed probes (~75s total) before the kernel gives up
+    // and reports the connection dead.
     {
         let sock_ref = socket2::SockRef::from(&stream);
-        let ka = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(15));
+        #[cfg(unix)]
+        let ka = ka.with_retries(3);
         let _ = sock_ref.set_tcp_keepalive(&ka);
     }
 
     // Unify TLS/plain into a single boxed tokio I/O object.
-    let mut boxed: Box<dyn crate::util::AsyncStream + Send + Unpin> =
-        match tls {
-            Some(acc) => Box::new(acc.accept(stream).await?),
-            None => Box::new(stream),
-        };
+    // P0-2: TLS accept timeout (15s) to prevent slowloris-style hangs.
+    let mut boxed: Box<dyn crate::util::AsyncStream + Send + Unpin> = match tls {
+        Some(acc) => {
+            let tls_stream = tokio::time::timeout(Duration::from_secs(15), acc.accept(stream))
+                .await
+                .map_err(|_| anyhow!("TLS handshake timeout (15s) from {addr}"))??;
+            Box::new(tls_stream)
+        }
+        None => Box::new(stream),
+    };
 
     // --- handshake ---
-    let (_client_id, token) = protocol::read_handshake(&mut boxed).await?;
-    let verified = state.clients.read().await.verify_token(&token);
+    // P0-2: handshake read timeout (15s) so a malicious peer that connects but
+    // never sends data cannot pin a server task forever.
+    let (_client_id, token) = tokio::time::timeout(
+        Duration::from_secs(15),
+        protocol::read_handshake(&mut boxed),
+    )
+    .await
+    .map_err(|_| anyhow!("handshake read timeout (15s) from {addr}"))??;
+
+    let verified = state.clients.read().await.verify_token(&token, &state.token_pepper);
     let client_id = match verified {
         Some((id, _enabled)) => id,
         None => {
@@ -79,43 +102,50 @@ async fn handle_tunnel(
         }
     };
 
-    // Enforce max concurrent clients.
-    {
-        let sessions = state.sessions.read().await;
-        if sessions.len() >= state.config.security.max_clients {
-            let _ = protocol::write_status(&mut boxed, false, "max clients reached").await;
-            state
-                .log("warn", "tunnel", format!("max clients reached, rejecting {client_id}"))
-                .await;
-            return Err(anyhow!("max clients reached"));
+    // Prepare session bookkeeping before acquiring the write lock.
+    let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(256);
+    let active_conns = Arc::new(AtomicU64::new(0));
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let listeners = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let max_clients = state.config.security.max_clients;
+
+    // P0-4: atomically check `max_clients` and insert the session under a single
+    // write lock. The previous code checked under a read lock and inserted
+    // later under a separate write lock, so N concurrent handshakes could all
+    // pass the check and then all insert, exceeding the limit.
+    let rejected = {
+        let mut sessions = state.sessions.write().await;
+        if sessions.len() >= max_clients {
+            true
+        } else {
+            sessions.insert(
+                client_id.clone(),
+                SessionInfo {
+                    client_id: client_id.clone(),
+                    session_id: session_id.clone(),
+                    remote_addr: addr.to_string(),
+                    connected_at: Utc::now(),
+                    active_conns: active_conns.clone(),
+                    proxy_tx: proxy_tx.clone(),
+                    listeners: listeners.clone(),
+                },
+            );
+            false
         }
+    };
+    if rejected {
+        let _ = protocol::write_status(&mut boxed, false, "max clients reached").await;
+        state
+            .log("warn", "tunnel", format!("max clients reached, rejecting {client_id}"))
+            .await;
+        return Err(anyhow!("max clients reached"));
     }
 
     protocol::write_status(&mut boxed, true, "ok").await?;
 
     // --- start yamux session ---
-    let conn = yamux::Connection::new(boxed.compat(), yamux::Config::default(), yamux::Mode::Server);
+    let conn = yamux::Connection::new(boxed.compat(), crate::tunnel::yamux_config(), yamux::Mode::Server);
 
-    let (proxy_tx, proxy_rx) = mpsc::channel::<ProxyRequest>(256);
-    let active_conns = Arc::new(AtomicU64::new(0));
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let listeners = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-
-    {
-        let mut sessions = state.sessions.write().await;
-        sessions.insert(
-            client_id.clone(),
-            SessionInfo {
-                client_id: client_id.clone(),
-                session_id: session_id.clone(),
-                remote_addr: addr.to_string(),
-                connected_at: Utc::now(),
-                active_conns: active_conns.clone(),
-                proxy_tx: proxy_tx.clone(),
-                listeners: listeners.clone(),
-            },
-        );
-    }
     state.log("info", "tunnel", format!("client {client_id} connected from {addr}")).await;
     state.ws.broadcast(json!({ "type": "session_change" }).to_string()).await;
 
@@ -226,14 +256,20 @@ async fn public_accept_loop(
                     continue;
                 }
                 let req = ProxyRequest { target: local_addr.clone(), conn };
-                match tx.try_send(req) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        tracing::debug!("proxy channel full for {client_id}, dropping {peer}");
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                // P1-5: instead of try_send (which silently drops the visitor
+                // connection when the channel is full), wait up to 200ms for
+                // the session driver to consume a slot. If still full, the
+                // visitor connection is dropped (closed) with an explicit log.
+                match tokio::time::timeout(Duration::from_millis(200), tx.send(req)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => {
                         tracing::info!("proxy channel closed for {client_id}; stopping listener");
                         break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "proxy channel full for {client_id}, visitor {peer} timed out after 200ms"
+                        );
                     }
                 }
             }

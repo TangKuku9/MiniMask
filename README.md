@@ -138,7 +138,6 @@ token_ttl_hours = 24
 [security]
 max_clients = 100
 max_conns_per_client = 512
-bw_limit_per_client = 0      # 0 = 不限速（预留）
 ```
 
 ## Docker

@@ -105,7 +105,18 @@ struct Settings {
     token: String,
     tls: bool,
     server_name: String,
+    /// Path to the pinned CA certificate (PEM). Used to verify the server's
+    /// TLS certificate. Defaults to `./data/ca.pem` (distributed from server).
+    #[serde(default = "default_ca_path")]
+    ca_path: String,
+    /// Skip TLS certificate verification. INSECURE — only for local debugging.
+    #[serde(default)]
+    insecure_skip_verify: bool,
     dark_mode: bool,
+}
+
+fn default_ca_path() -> String {
+    "./data/ca.pem".to_string()
 }
 
 impl Default for Settings {
@@ -116,6 +127,8 @@ impl Default for Settings {
             token: String::new(),
             tls: true,
             server_name: "localhost".to_string(),
+            ca_path: "./data/ca.pem".to_string(),
+            insecure_skip_verify: false,
             dark_mode: true,
         }
     }
@@ -247,6 +260,8 @@ impl App {
             token: self.settings.token.trim().to_string(),
             tls: self.settings.tls,
             server_name: self.settings.server_name.trim().to_string(),
+            ca_path: self.settings.ca_path.trim().to_string(),
+            insecure_skip_verify: self.settings.insecure_skip_verify,
         };
 
         // Bridge tokio's async channel to a std channel the UI thread can poll.
@@ -285,12 +300,16 @@ impl App {
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
             running.cancel.cancel();
-            // Dropping the runtime here would block; instead detach it on a
-            // helper thread so the UI stays responsive.
+            // P2-13: shut the runtime down with a bounded timeout instead of
+            // plain `drop`. A bare `drop` waits forever for all spawned tasks
+            // to finish, which can leak helper threads when the user toggles
+            // connect/disconnect repeatedly. `shutdown_timeout` drains pending
+            // tasks for at most 1s then forcibly cancels the rest.
+            //
+            // Still offloaded to a helper thread so the UI never blocks.
             std::thread::spawn(move || {
-                // Give the task a moment to observe cancellation, then drop.
                 let Running { _runtime, .. } = running;
-                drop(_runtime);
+                _runtime.shutdown_timeout(std::time::Duration::from_secs(1));
             });
         }
         self.state = None;
@@ -481,6 +500,25 @@ impl App {
                             egui::TextEdit::singleline(&mut self.settings.server_name)
                                 .hint_text("localhost（需与服务端证书 SAN 匹配）")
                                 .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+
+                        ui.label("CA 证书路径");
+                        ui.add_enabled(
+                            !running && self.settings.tls && !self.settings.insecure_skip_verify,
+                            egui::TextEdit::singleline(&mut self.settings.ca_path)
+                                .hint_text("data/ca.pem（从服务端拷贝）")
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.end_row();
+
+                        ui.label("跳过证书校验");
+                        ui.add_enabled(
+                            !running && self.settings.tls,
+                            egui::Checkbox::new(
+                                &mut self.settings.insecure_skip_verify,
+                                "禁用 TLS 证书校验（仅本地调试，不安全）",
+                            ),
                         );
                         ui.end_row();
                     });

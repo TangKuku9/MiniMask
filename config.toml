@@ -32,5 +32,3 @@ token_ttl_hours = 24
 max_clients = 100
 # Max concurrent proxied connections per tunnel client.
 max_conns_per_client = 512
-# Bandwidth limit in bytes/sec per tunnel client (0 = unlimited).
-bw_limit_per_client = 0

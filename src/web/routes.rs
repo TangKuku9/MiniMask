@@ -67,7 +67,8 @@ pub async fn create_client(
         .clients
         .write()
         .await
-        .add_client(req.name.trim())?;
+        .add_client(req.name.trim(), &state.token_pepper)
+        .await?;
     state
         .log("info", "client", format!("{} created client {} ({})", user.username, client.id, client.name))
         .await;
@@ -90,7 +91,8 @@ pub async fn update_client(
         .clients
         .write()
         .await
-        .set_client_enabled(&id, req.enabled)?;
+        .set_client_enabled(&id, req.enabled)
+        .await?;
     if !found {
         return Err(AppError::NotFound);
     }
@@ -110,7 +112,7 @@ pub async fn delete_client(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let found = state.clients.write().await.delete_client(&id)?;
+    let found = state.clients.write().await.delete_client(&id).await?;
     if !found {
         return Err(AppError::NotFound);
     }
@@ -130,7 +132,8 @@ pub async fn regenerate_token(
         .clients
         .write()
         .await
-        .regenerate_token(&id)?
+        .regenerate_token(&id, &state.token_pepper)
+        .await?
         .ok_or(AppError::NotFound)?;
     state
         .log("warn", "client", format!("{} regenerated token for client {id}", user.username))
@@ -174,7 +177,8 @@ pub async fn create_mapping(
         .clients
         .write()
         .await
-        .add_mapping(&req.client_id, req.name.trim(), req.remote_port, &req.local_addr)?
+        .add_mapping(&req.client_id, req.name.trim(), req.remote_port, &req.local_addr)
+        .await?
         .ok_or_else(|| AppError::Conflict("remote_port already in use or client not found".into()))?;
     if mapping.enabled {
         let _ = listener::add_listener(&state, &req.client_id, &mapping).await;
@@ -195,7 +199,8 @@ pub async fn update_mapping(
         .clients
         .write()
         .await
-        .set_mapping_enabled(&id, req.enabled)?;
+        .set_mapping_enabled(&id, req.enabled)
+        .await?;
     if !found {
         return Err(AppError::NotFound);
     }
@@ -217,7 +222,7 @@ pub async fn delete_mapping(
     user: AuthedUser,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let found = state.clients.write().await.delete_mapping(&id)?;
+    let found = state.clients.write().await.delete_mapping(&id).await?;
     if !found {
         return Err(AppError::NotFound);
     }

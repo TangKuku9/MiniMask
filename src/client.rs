@@ -35,6 +35,14 @@ pub struct ClientArgs {
     /// SNI / server name used for TLS (must match a SAN in the server cert)
     #[arg(long, default_value = "localhost")]
     pub server_name: String,
+    /// Path to the pinned CA certificate (PEM). Required when `--tls` is set
+    /// unless `--insecure-skip-verify` is used. Defaults to `./data/ca.pem`.
+    #[arg(long, default_value = "./data/ca.pem")]
+    pub ca_path: String,
+    /// Skip TLS certificate verification entirely. INSECURE — only for local
+    /// debugging. Hidden from help output to avoid accidental use.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub insecure_skip_verify: bool,
 }
 
 /// Log severity for events emitted by the client.
@@ -151,13 +159,21 @@ impl CancelToken {
     }
 }
 
-/// Supervised client loop used by the GUI. Reconnects with backoff and reports
-/// state/log events through `sink`. Returns once `cancel` fires.
+/// Supervised client loop used by the GUI. Reconnects with exponential backoff
+/// (0.5s → 30s, ±10% jitter) and reports state/log events through `sink`.
+/// Returns once `cancel` fires.
 pub async fn run_supervised(args: ClientArgs, sink: EventSink, cancel: CancelToken) -> Result<()> {
     sink.info(format!(
         "客户端启动，连接到 {} (TLS={}) 身份 {}",
         args.server, args.tls, args.id
     ));
+
+    // Exponential backoff parameters (P0-3).
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+    const JITTER_RATIO: f64 = 0.10; // ±10%
+
+    let mut backoff = INITIAL_BACKOFF;
 
     loop {
         if cancel.is_cancelled() {
@@ -174,9 +190,10 @@ pub async fn run_supervised(args: ClientArgs, sink: EventSink, cancel: CancelTok
             }
         };
 
-        match result {
-            Ok(()) => sink.warn("隧道已关闭，3 秒后重连"),
-            Err(e) => sink.error(format!("隧道错误：{e}；3 秒后重连")),
+        let succeeded = matches!(result, Ok(()));
+        match &result {
+            Ok(()) => sink.warn(format!("隧道已关闭，{:.2?} 后重连", backoff)),
+            Err(e) => sink.error(format!("隧道错误：{e}；{:.2?} 后重连", backoff)),
         }
 
         if cancel.is_cancelled() {
@@ -184,20 +201,50 @@ pub async fn run_supervised(args: ClientArgs, sink: EventSink, cancel: CancelTok
             return Ok(());
         }
 
+        // Sleep with jitter, then grow the backoff for the next round.
+        // On a successful (but later closed) connection we still back off briefly
+        // but reset to the initial value so transient disconnects recover fast.
+        let sleep_dur = jitter(backoff, JITTER_RATIO);
         sink.state(ConnState::Reconnecting);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = tokio::time::sleep(sleep_dur) => {}
             _ = cancel.cancelled() => {
                 sink.info("已停止");
                 return Ok(());
             }
         }
+
+        if succeeded {
+            // Connection was established cleanly; reset backoff so the next
+            // reconnect attempt is fast.
+            backoff = INITIAL_BACKOFF;
+        } else {
+            // Grow backoff: backoff = min(backoff * 2, MAX_BACKOFF).
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
     }
+}
+
+/// Apply symmetric ±`ratio` jitter to `d`. Returns a duration in
+/// `[d * (1 - ratio), d * (1 + ratio)]`.
+fn jitter(d: Duration, ratio: f64) -> Duration {
+    use rand::Rng;
+    let millis = d.as_millis() as f64;
+    let factor = 1.0 + (rand::thread_rng().gen_range(-ratio..=ratio));
+    let jittered = (millis * factor).max(0.0) as u64;
+    Duration::from_millis(jittered)
 }
 
 async fn run_once(args: &ClientArgs, sink: &EventSink) -> Result<()> {
     sink.info(format!("正在连接 {} ...", args.server));
-    let stream = TcpStream::connect(&args.server).await?;
+
+    // P0-2: TCP connect timeout (10s).
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect(&args.server),
+    )
+    .await
+    .map_err(|_| anyhow!("连接 {} 超时（10s）", args.server))??;
     sink.info(format!("TCP 已连接到 {}", args.server));
 
     // Enable TCP keepalive to prevent NAT/firewall idle timeouts from killing
@@ -210,21 +257,49 @@ async fn run_once(args: &ClientArgs, sink: &EventSink) -> Result<()> {
 
     let mut boxed: Box<dyn crate::util::AsyncStream + Send + Unpin> = if args.tls {
         sink.info(format!("开始 TLS 握手 (server_name={})", args.server_name));
-        let connector = util::build_dangerous_tls_connector()?;
+        // P0-1: use CA pinning by default; only fall back to the dangerous
+        // connector when the user explicitly opts in via --insecure-skip-verify.
+        let connector = if args.insecure_skip_verify {
+            sink.warn("已禁用 TLS 证书校验（--insecure-skip-verify），仅用于本地调试");
+            util::build_dangerous_tls_connector()
+        } else {
+            let ca_path = std::path::Path::new(&args.ca_path);
+            util::build_tls_connector_with_ca(ca_path).map_err(|e| {
+                anyhow!(
+                    "加载 CA 证书失败 ({}): {e}\n提示：请从服务端 data/ca.pem 拷贝到客户端，或使用 --insecure-skip-verify 调试",
+                    args.ca_path
+                )
+            })
+        }?;
         let server_name = rustls::pki_types::ServerName::try_from(args.server_name.clone())
             .map_err(|e| anyhow!("非法的 server name '{}': {e}", args.server_name))?;
-        Box::new(connector.connect(server_name, stream).await?)
+        // P0-2: TLS handshake timeout (15s).
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(15),
+            connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| anyhow!("TLS 握手超时（15s）"))??;
+        Box::new(tls_stream)
     } else {
         Box::new(stream)
     };
     sink.info("传输通道就绪");
 
+    // P0-2: handshake write + status read timeout (15s total).
     sink.info(format!("发送握手 (id={})", args.id));
-    protocol::write_handshake(&mut boxed, &args.id, &args.token).await?;
-    sink.info("等待认证结果 ...");
-    let (ok, msg) = match protocol::read_status(&mut boxed).await {
-        Ok(v) => v,
-        Err(e) => {
+    let (ok, msg) = match tokio::time::timeout(
+        Duration::from_secs(15),
+        async {
+            protocol::write_handshake(&mut boxed, &args.id, &args.token).await?;
+            sink.info("等待认证结果 ...");
+            protocol::read_status(&mut boxed).await
+        },
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
             // Provide a helpful hint when the server closes the connection
             // immediately after the handshake. This usually means the server
             // expects TLS but the client connected without --tls.
@@ -234,6 +309,9 @@ async fn run_once(args: &ClientArgs, sink: &EventSink) -> Result<()> {
             }
             return Err(e);
         }
+        Err(_) => {
+            return Err(anyhow!("握手超时（15s）"));
+        }
     };
     if !ok {
         return Err(anyhow!("服务端拒绝：{msg}"));
@@ -241,7 +319,7 @@ async fn run_once(args: &ClientArgs, sink: &EventSink) -> Result<()> {
     sink.info("认证成功，隧道已建立");
     sink.state(ConnState::Connected);
 
-    let conn = yamux::Connection::new(boxed.compat(), yamux::Config::default(), yamux::Mode::Client);
+    let conn = yamux::Connection::new(boxed.compat(), crate::tunnel::yamux_config(), yamux::Mode::Client);
     run_client_session(conn, sink).await;
     Ok(())
 }
@@ -274,9 +352,61 @@ where
 
 async fn handle_client_stream(stream: yamux::Stream, sink: &EventSink) -> Result<()> {
     let mut stream = stream.compat();
-    let target = protocol::read_target(&mut stream).await?;
+    // P0-2: read target with a timeout so a malformed open doesn't hang forever.
+    let target = tokio::time::timeout(Duration::from_secs(15), protocol::read_target(&mut stream))
+        .await
+        .map_err(|_| anyhow!("读取目标地址超时（15s）"))??;
     sink.info(format!("隧道 -> {target}"));
-    let mut local = TcpStream::connect(&target).await?;
-    let _ = tokio::io::copy_bidirectional(&mut stream, &mut local).await;
+    // P0-2: local dial timeout (5s) so a dead local service can't pin a stream.
+    let mut local = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(&target),
+    )
+    .await
+    .map_err(|_| anyhow!("本地拨号 {target} 超时（5s）"))??;
+    // P1-9: copy with idle timeout so a hung local service or idle visitor
+    // can't pin a yamux stream forever.
+    let _ = copy_bidirectional_idle(&mut stream, &mut local, crate::tunnel::PROXY_IDLE_TIMEOUT).await;
     Ok(())
+}
+
+/// Like `tokio::io::copy_bidirectional` but aborts if neither direction
+/// transfers data within `idle`. The timer resets on every successful read
+/// on either side.
+async fn copy_bidirectional_idle<A, B>(a: &mut A, b: &mut B, idle: Duration) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut a_buf = [0u8; 16384];
+    let mut b_buf = [0u8; 16384];
+    let mut a_to_b: u64 = 0;
+    let mut b_to_a: u64 = 0;
+
+    loop {
+        tokio::select! {
+            // biased: check for data first, then idle timeout
+            biased;
+            r = a.read(&mut a_buf) => {
+                let n = r?;
+                if n == 0 { break; }
+                b.write_all(&a_buf[..n]).await?;
+                a_to_b += n as u64;
+            }
+            r = b.read(&mut b_buf) => {
+                let n = r?;
+                if n == 0 { break; }
+                a.write_all(&b_buf[..n]).await?;
+                b_to_a += n as u64;
+            }
+            _ = tokio::time::sleep(idle) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("idle timeout after {:?}", idle),
+                ));
+            }
+        }
+    }
+    Ok((a_to_b, b_to_a))
 }

@@ -2,6 +2,7 @@
 
 use crate::state::Stats;
 use crate::tunnel::protocol;
+use crate::tunnel::PROXY_IDLE_TIMEOUT;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,6 +44,9 @@ pub async fn proxy_connection(
     }
 }
 
+/// Copy bytes from `r` to `w`, counting each chunk into `counter`. If no data
+/// is read within `PROXY_IDLE_TIMEOUT`, the copy aborts with a `TimedOut` error,
+/// which prevents a hung local service from pinning a yamux stream forever.
 async fn copy_count<R, W>(
     r: &mut R,
     w: &mut W,
@@ -55,7 +59,15 @@ where
     let mut buf = [0u8; 16384];
     let mut total = 0u64;
     loop {
-        let n = r.read(&mut buf).await?;
+        // P1-9: idle timeout — if no data arrives within the timeout, abort.
+        let n = tokio::time::timeout(PROXY_IDLE_TIMEOUT, r.read(&mut buf))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("proxy idle timeout after {:?}", PROXY_IDLE_TIMEOUT),
+                )
+            })??;
         if n == 0 {
             break;
         }
